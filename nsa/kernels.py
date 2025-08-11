@@ -1149,10 +1149,8 @@ def _nsa_sliding_window_fwd_kernel(
     window_start = tl.maximum(0, offs_m - WINDOW_SIZE + 1)
     window_end = tl.minimum(offs_m + 1, N_CTX)
 
-    lo = tl.min(window_start)
-    hi = tl.max(window_end)
-
-    for start_n in range(lo, hi, BLOCK_N):
+    # Cannot use runtime values in range(), must iterate full sequence
+    for start_n in range(0, N_CTX, BLOCK_N):
         K_block_ptr = tl.make_block_ptr(
             base=K + k_offset,
             shape=(HEAD_DIM_QK, N_CTX),
@@ -1363,12 +1361,9 @@ def _nsa_sliding_window_bwd_kernel(
     win_lo = tl.maximum(0, offs_m - WINDOW_SIZE + 1)
     win_hi = tl.minimum(offs_m + 1, N_CTX)
 
-    lo = tl.min(win_lo).to(tl.int32)
-    hi = tl.max(win_hi).to(tl.int32)
-
-    # For backward, iterate from lo to hi without block alignment
-    # The mask will handle the window boundaries correctly
-    for start_n in range(lo, hi, BLOCK_N):
+    # Cannot use runtime values in range(), must iterate full sequence
+    # and rely on masking for correctness
+    for start_n in range(0, N_CTX, BLOCK_N):
         K_ptr = tl.make_block_ptr(
             base=K + k_off,
             shape=(HEAD_DIM_QK, N_CTX),
@@ -1914,16 +1909,10 @@ def select_top_k_blocks_per_query_with_gqa(
     # Ensure we don't select more blocks than available
     k_actual = min(n_dynamic, n_blocks)
 
-    # Add tiny deterministic tie-breaker by block index to ensure stable ordering
-    eps = 1e-6
-    tie_breaker = torch.arange(
-        n_blocks, device=aggregated_scores.device, dtype=aggregated_scores.dtype
-    )
-    aggregated_scores = aggregated_scores + eps * tie_breaker.view(1, 1, 1, -1)
-
-    _, top_indices = torch.topk(
-        aggregated_scores, k=k_actual, dim=-1
-    )  # [B, G, T, k_actual]
+    # Use stable sort for complete determinism instead of topk
+    # Sort in descending order and take top k
+    _, sorted_indices = torch.sort(aggregated_scores, dim=-1, descending=True, stable=True)
+    top_indices = sorted_indices[..., :k_actual]  # [B, G, T, k_actual]
 
     # Pad if we selected fewer blocks than needed
     if k_actual < n_dynamic:
@@ -2186,6 +2175,28 @@ class NSAAttention(torch.nn.Module):
         device = hidden_states.device
         dtype = hidden_states.dtype
 
+        # Deterministic eval: optionally disable TF32 and enforce deterministic
+        # algorithms for the entire forward to ensure reproducibility across
+        # repeated calls with identical inputs.
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if torch.cuda.is_available() else None
+        prev_prec = None
+        prev_det = torch.are_deterministic_algorithms_enabled()
+        if hasattr(torch, "get_float32_matmul_precision"):
+            try:
+                prev_prec = torch.get_float32_matmul_precision()
+            except Exception:
+                prev_prec = None
+        if not self.training:
+            try:
+                if torch.cuda.is_available():
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+                # Enforce deterministic algorithms during eval forward
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+
         # Project queries
         q = self.q_proj(hidden_states)  # [B, T, H*dk]
         q = q.view(B, T, self.config.n_heads, self.config.head_dim_qk).transpose(
@@ -2301,243 +2312,42 @@ class NSAAttention(torch.nn.Module):
         k_slide_kernel = k_slide.transpose(-1, -2).contiguous()
         v_slide_kernel = v_slide.contiguous()
 
-        # Choose whether to use autograd wrappers based on training mode
-        if self.training and torch.is_grad_enabled():
-            # Training mode: use autograd wrappers for gradient support
-            o_compress = CompressionAttention.apply(
-                q_kernel,
-                k_compressed,
-                v_compressed,
-                block_ends,
-                self.scale,
-                self.config,
-            )
+        # Use autograd wrappers in both train/eval for consistency
+        o_compress = CompressionAttention.apply(
+            q_kernel,
+            k_compressed,
+            v_compressed,
+            block_ends,
+            self.scale,
+            self.config,
+        )
 
-            o_select = SelectionAttention.apply(
-                q_kernel,
-                k_sel_kernel,
-                v_sel_kernel,
-                selected_indices,
-                self.scale,
-                self.config,
-            )
+        o_select = SelectionAttention.apply(
+            q_kernel,
+            k_sel_kernel,
+            v_sel_kernel,
+            selected_indices,
+            self.scale,
+            self.config,
+        )
 
-            o_slide = SlidingWindowAttention.apply(
-                q_kernel,
-                k_slide_kernel,
-                v_slide_kernel,
-                self.scale,
-                self.config.w,
-                self.config,
-            )
-        else:
-            # Inference mode: call kernels directly for maximum speed
-            # Initialize outputs
-            o_compress = torch.zeros(
-                B, H, T, self.config.head_dim_v, device=device, dtype=dtype
-            )
-            o_select = torch.zeros(
-                B, H, T, self.config.head_dim_v, device=device, dtype=dtype
-            )
-            o_slide = torch.zeros(
-                B, H, T, self.config.head_dim_v, device=device, dtype=dtype
-            )
+        o_slide = SlidingWindowAttention.apply(
+            q_kernel,
+            k_slide_kernel,
+            v_slide_kernel,
+            self.scale,
+            self.config.w,
+            self.config,
+        )
 
-            # Prepare L/M tensors for statistics
-            L = torch.zeros(B, H, T, device=device, dtype=torch.float32)
-            M = torch.zeros(B, H, T, device=device, dtype=torch.float32)
-
-            # Call compression kernel directly
-            grid_comp = lambda META: (
-                triton.cdiv(T, META["BLOCK_M"]),
-                B * H,
-            )
-
-            _nsa_compression_fwd_kernel[grid_comp](
-                q_kernel,
-                k_compressed,
-                v_compressed,
-                block_ends,
-                o_compress,
-                self.scale,  # sm_scale parameter
-                L,
-                M,
-                # Strides for Q
-                q_kernel.stride(0),
-                q_kernel.stride(1),
-                q_kernel.stride(2),
-                q_kernel.stride(3),
-                # Strides for K (compressed)
-                k_compressed.stride(0),
-                k_compressed.stride(1),
-                k_compressed.stride(2),
-                k_compressed.stride(3),
-                # Strides for V (compressed)
-                v_compressed.stride(0),
-                v_compressed.stride(1),
-                v_compressed.stride(2),
-                v_compressed.stride(3),
-                # Strides for output
-                o_compress.stride(0),
-                o_compress.stride(1),
-                o_compress.stride(2),
-                o_compress.stride(3),
-                # Strides for L/M
-                L.stride(0),
-                L.stride(1),
-                L.stride(2),
-                M.stride(0),
-                M.stride(1),
-                M.stride(2),
-                # Shape parameters
-                Z=B,
-                H=H,
-                N_KV_GROUPS=G,
-                N_CTX_Q=T,
-                N_BLOCKS=n_blocks_actual,  # Use actual count, not padded
-                # Dimensions (use padded for Triton)
-                HEAD_DIM_QK=self.config.head_dim_qk_padded,
-                HEAD_DIM_V=self.config.head_dim_v_padded,
-                # Tiling
-                BLOCK_M=self.config.block_m,
-                BLOCK_N=self.config.block_n,
-            )
-
-            # Call selection kernel
-            grid_sel = lambda META: (
-                triton.cdiv(T, META["BLOCK_M"]),
-                B * H,
-            )
-    
-            _nsa_sparse_selection_fwd_kernel[grid_sel](
-                q_kernel,
-                k_sel_kernel,
-                v_sel_kernel,
-                selected_indices.to(
-                    torch.int32
-                ).contiguous(),  # [B, G, T, n] - convert to int32 for Triton
-                o_select,
-                self.scale,
-                L,
-                M,
-                # Strides for Q
-                q_kernel.stride(0),
-                q_kernel.stride(1),
-                q_kernel.stride(2),
-                q_kernel.stride(3),
-                # Strides for K
-                k_sel_kernel.stride(0),
-                k_sel_kernel.stride(1),
-                k_sel_kernel.stride(2),
-                k_sel_kernel.stride(3),
-                # Strides for V
-                v_sel_kernel.stride(0),
-                v_sel_kernel.stride(1),
-                v_sel_kernel.stride(2),
-                v_sel_kernel.stride(3),
-                # Strides for output
-                o_select.stride(0),
-                o_select.stride(1),
-                o_select.stride(2),
-                o_select.stride(3),
-                # Strides for block indices (now with group dimension)
-                selected_indices.stride(0),
-                selected_indices.stride(1),
-                selected_indices.stride(2),
-                selected_indices.stride(3),
-                # Strides for L/M
-                L.stride(0),
-                L.stride(1),
-                L.stride(2),
-                M.stride(0),
-                M.stride(1),
-                M.stride(2),
-                # Shape parameters
-                Z=B,
-                H=H,
-                N_KV_GROUPS=G,
-                N_CTX_Q=T,
-                N_CTX_KV=T,
-                # NSA parameters
-                N_BLOCKS=self.config.n,
-                BLOCK_SIZE_SELECTION=self.config.l_prime,
-                # Dimensions (use padded for Triton)
-                HEAD_DIM_QK=self.config.head_dim_qk_padded,
-                HEAD_DIM_V=self.config.head_dim_v_padded,
-                # Tiling
-                BLOCK_M=self.config.block_m,
-                BLOCK_N=self.config.block_n,
-                # Flags
-                IS_CAUSAL=True,
-            )
-    
-            # Call sliding window kernel
-            grid_slide = lambda META: (
-                triton.cdiv(T, META["BLOCK_M"]),
-                B * H,
-            )
-    
-            _nsa_sliding_window_fwd_kernel[grid_slide](
-                q_kernel,
-                k_slide_kernel,
-                v_slide_kernel,
-                o_slide,
-                self.scale,
-                L,
-                M,
-                # Strides for Q
-                q_kernel.stride(0),
-                q_kernel.stride(1),
-                q_kernel.stride(2),
-                q_kernel.stride(3),
-                # Strides for K
-                k_slide_kernel.stride(0),
-                k_slide_kernel.stride(1),
-                k_slide_kernel.stride(2),
-                k_slide_kernel.stride(3),
-                # Strides for V
-                v_slide_kernel.stride(0),
-                v_slide_kernel.stride(1),
-                v_slide_kernel.stride(2),
-                v_slide_kernel.stride(3),
-                # Strides for output
-                o_slide.stride(0),
-                o_slide.stride(1),
-                o_slide.stride(2),
-                o_slide.stride(3),
-                # Strides for L/M
-                L.stride(0),
-                L.stride(1),
-                L.stride(2),
-                M.stride(0),
-                M.stride(1),
-                M.stride(2),
-                # Shape parameters
-                Z=B,
-                H=H,
-                N_KV_GROUPS=G,
-                N_CTX=T,
-                # Window
-                WINDOW_SIZE=self.config.w,
-                # Dimensions (use padded for Triton)
-                HEAD_DIM_QK=self.config.head_dim_qk_padded,
-                HEAD_DIM_V=self.config.head_dim_v_padded,
-                # Tiling
-                BLOCK_M=self.config.block_m,
-                BLOCK_N=self.config.block_n,
-            )
-
-        # 5. GATE AND MIX branches
+        # 5. GATE AND MIX branches (softmax, deterministic op order)
         gates = self.gate_mlp(hidden_states)  # [B, T, 3*H]
-        gates = torch.sigmoid(gates).view(B, T, 3, self.config.n_heads, 1)
-        gates = gates.transpose(2, 3).transpose(1, 2)  # [B, H, T, 3, 1]
+        gates = gates.view(B, T, self.config.n_heads, 3).permute(0, 2, 1, 3)  # [B, H, T, 3]
+        gates = torch.softmax(gates, dim=-1)
 
-        # Mix outputs
-        o_mixed = (
-            gates[..., 0, :] * o_compress
-            + gates[..., 1, :] * o_select
-            + gates[..., 2, :] * o_slide
-        )  # [B, H, T, dv]
+        o_mixed = o_compress.mul(gates[..., 0:1])
+        o_mixed = o_mixed.add(o_select.mul(gates[..., 1:2]))
+        o_mixed = o_mixed.add(o_slide.mul(gates[..., 2:3]))  # [B, H, T, dv]
 
         # 6. OUTPUT PROJECTION
         o_mixed = o_mixed.transpose(1, 2).contiguous()  # [B, T, H, dv]
@@ -2553,7 +2363,19 @@ class NSAAttention(torch.nn.Module):
                 "compression_scores": compression_scores,
                 "selection_scores": selection_scores,
                 "selected_indices": selected_indices,
-                "gates": gates.squeeze(-1).transpose(1, 2),  # [B, T, H, 3]
+                "gates": gates.permute(0, 2, 1, 3),  # [B, T, H, 3]
             }
+
+        # Restore determinism/matmul settings at the very end (after all dense ops)
+        if not self.training:
+            try:
+                if torch.cuda.is_available() and prev_tf32 is not None:
+                    torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+                if prev_prec is not None and hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision(prev_prec)
+                # Restore previous deterministic mode
+                torch.use_deterministic_algorithms(prev_det)
+            except Exception:
+                pass
 
         return output, attn_info
