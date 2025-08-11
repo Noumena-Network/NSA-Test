@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+*.egg-info
+.DS_Store
+*.tar.gz
+*.yaml
+build-triton-and-test.sh
+Dockerfile
+.dockerignore
