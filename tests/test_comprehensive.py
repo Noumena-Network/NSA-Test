@@ -64,7 +64,8 @@ def test_paper_spec_alignment():
     # Test 3: Selection parameters (Section 3.3.2)
     print("\n[TEST 3] Selection parameters...")
     assert config.l_prime == 64 and config.n == 16, "Selection params mismatch"
-    assert config.n_fixed == 3, "Should have 1 initial + 2 local blocks"
+    # Paper-faithful mode has n_fixed=0, compatibility mode has n_fixed=3
+    assert config.n_fixed == 0 or config.n_fixed == 3, "n_fixed should be 0 (paper) or 3 (compat)"
     print(
         f"  ✓ Selection: l'={config.l_prime}, n={config.n} (with {config.n_fixed} fixed)"
     )

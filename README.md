@@ -74,6 +74,16 @@ _nsa_sliding_window_fwd_kernel[grid](
 
 ## Critical Implementation Notes
 
+### Gate Mechanism (Eq. 5)
+By default, gating follows the paper: per-branch gates via MLP + sigmoid, applied per head and timestep.
+Set `NSAConfig.gate_mode` to `"sigmoid"` (default, paper-faithful) or `"softmax"` (normalized).
+
+### Selection (Eq. 8→9→10→11)
+Block importance scores derive from compression attention (Eq. 8), mapped via the triangular rule (Eq. 9),
+aggregated across heads in each GQA group (Eq. 10), then top-n blocks are selected per query (Eq. 11).
+By default, selection includes 1 initial + 2 local blocks (paper training config). To disable this and use pure top‑n,
+set `NSAConfig.include_fixed_in_selection=False`.
+
 ### K Tensor Layout
 The K tensor uses shape `[B, G, dk, T]` but the kernel expects strides as if it were `[B, G, T, dk]`. 
 **Always swap the last two stride values when calling kernels:**

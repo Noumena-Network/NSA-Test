@@ -491,6 +491,15 @@ def test_selection_branch():
                     uniq[:n], device=device, dtype=torch.int32
                 )
 
+    # Canonicalize indices with fallback used by wrapper (ensure at least one block):
+    # if all indices are -1 for a (b,g,t), fallback to the block containing t
+    if block_indices.numel() > 0:
+        t_blocks = (torch.arange(T, device=device, dtype=torch.int32) // l_prime).view(1, 1, T, 1)
+        no_valid = (block_indices < 0).all(dim=-1, keepdim=True)
+        block_indices_eff = torch.where(no_valid, t_blocks, block_indices)
+    else:
+        block_indices_eff = block_indices
+
     # Dense masked reference (GQA expanded)
     heads_per_group = H // G
     k_exp = k.unsqueeze(2).expand(B, G, heads_per_group, dk, T).reshape(B, H, dk, T)
@@ -502,7 +511,7 @@ def test_selection_branch():
             g = h // heads_per_group
             for t in range(T):
                 for nb in range(n):
-                    blk = int(block_indices[b, g, t, nb].item())
+                    blk = int(block_indices_eff[b, g, t, nb].item())
                     if blk >= 0:  # Skip -1 sentinel values
                         start = blk * l_prime
                         end = min(start + l_prime, T)
@@ -533,12 +542,12 @@ def test_selection_branch():
     grid = lambda META: (triton.cdiv(T, META["BLOCK_M"]), B * H)
 
     _nsa_sparse_selection_fwd_kernel[grid](
-        q, k, v, block_indices, out_kernel, scale, L, M,
+        q, k, v, block_indices_eff, out_kernel, scale, L, M,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(3), k.stride(2),  # SWAPPED
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out_kernel.stride(0), out_kernel.stride(1), out_kernel.stride(2), out_kernel.stride(3),
-        block_indices.stride(0), block_indices.stride(1), block_indices.stride(2), block_indices.stride(3),
+        block_indices_eff.stride(0), block_indices_eff.stride(1), block_indices_eff.stride(2), block_indices_eff.stride(3),
         L.stride(0), L.stride(1), L.stride(2),
         M.stride(0), M.stride(1), M.stride(2),
         Z=B, H=H, N_KV_GROUPS=G, N_CTX_Q=T, N_CTX_KV=T,
@@ -554,7 +563,7 @@ def test_selection_branch():
 
     _nsa_sparse_selection_bwd_kernel[grid](
         # Forward tensors
-        q, k, v, block_indices, out_kernel, grad_out,
+        q, k, v, block_indices_eff, out_kernel, grad_out,
         scale, L, M,
         # Strides - Q/K/V/Out
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -562,7 +571,7 @@ def test_selection_branch():
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out_kernel.stride(0), out_kernel.stride(1), out_kernel.stride(2), out_kernel.stride(3),
         # Strides - Block indices
-        block_indices.stride(0), block_indices.stride(1), block_indices.stride(2), block_indices.stride(3),
+        block_indices_eff.stride(0), block_indices_eff.stride(1), block_indices_eff.stride(2), block_indices_eff.stride(3),
         # Strides - L/M
         L.stride(0), L.stride(1), L.stride(2),
         M.stride(0), M.stride(1), M.stride(2),

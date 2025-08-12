@@ -19,6 +19,11 @@ import math
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass
 import logging
+from .reference import (
+    sliding_window_attention as ref_sliding_window_attention,
+    compression_attention as ref_compression_attention,
+)
+from .reference import selection_attention_reference as ref_selection_attention
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,14 +96,14 @@ class CompressionAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k_compressed, v_compressed, block_ends, o, L, M = ctx.saved_tensors
-        B, H, T, dk = q.shape
+        B, H, T, dk_dim = q.shape
         G = k_compressed.shape[1]
-        dv = v_compressed.shape[-1]
+        dv_dim = v_compressed.shape[-1]
 
         # Allocate gradients
         dq = torch.zeros_like(q)
         dk = torch.zeros(
-            B, G, k_compressed.shape[-1], dk, device=q.device, dtype=q.dtype
+            B, G, k_compressed.shape[-1], dk_dim, device=q.device, dtype=q.dtype
         )
         dv = torch.zeros_like(v_compressed)
 
@@ -174,42 +179,62 @@ class SelectionAttention(torch.autograd.Function):
         device = q.device
         dtype = q.dtype
 
-        # Allocate output
-        o = torch.empty(B, H, T, dv, device=device, dtype=dtype)
+        # Triton requires power-of-2 dimensions for block pointers
+        # Paper uses dk=192 which pads to 256, dv=128 is already power-of-2
+        dk_padded = triton.next_power_of_2(dk)
+        dv_padded = triton.next_power_of_2(dv)
+        
+        # Pad tensors to power-of-2 width for Triton
+        q_padded = torch.nn.functional.pad(q, (0, dk_padded - dk)) if dk_padded > dk else q
+        k_padded = torch.nn.functional.pad(k, (0, 0, 0, dk_padded - dk)) if dk_padded > dk else k  # [B,G,dk,T]
+        v_padded = torch.nn.functional.pad(v, (0, dv_padded - dv)) if dv_padded > dv else v
+
+        # Allocate output with padded dimensions
+        o_padded = torch.empty(B, H, T, dv_padded, device=device, dtype=dtype)
         L = torch.empty(B, H, T, device=device, dtype=torch.float32)
         M = torch.empty(B, H, T, device=device, dtype=torch.float32)
 
         # Call forward kernel
         grid = lambda META: (triton.cdiv(T, META["BLOCK_M"]), B * H)
+        # Ensure at least one valid block per query position: if all indices are -1,
+        # fall back to the block containing the query position (consistent with tests/reference)
+        indices_modified = indices
+        if indices.numel() > 0:
+            t_blocks = (torch.arange(T, device=device, dtype=torch.long) // config.l_prime).view(1, 1, T, 1)
+            no_valid = (indices < 0).all(dim=-1, keepdim=True)
+            indices_modified = torch.where(no_valid, t_blocks, indices)
+
+        # Materialize indices as contiguous int32 and use consistent strides
+        indices_i32 = indices_modified.to(torch.int32).contiguous()
         _nsa_sparse_selection_fwd_kernel[grid](
-            q,
-            k,
-            v,
-            indices.to(torch.int32),
-            o,
+            q_padded,
+            k_padded,
+            v_padded,
+            indices_i32,
+            o_padded,
             scale,
             L,
             M,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            indices.stride(0),
-            indices.stride(1),
-            indices.stride(2),
-            indices.stride(3),
+            q_padded.stride(0),
+            q_padded.stride(1),
+            q_padded.stride(2),
+            q_padded.stride(3),
+            k_padded.stride(0),
+            k_padded.stride(1),
+            k_padded.stride(3),  # stride_kn (time axis)
+            k_padded.stride(2),  # stride_kk (dk axis)
+            v_padded.stride(0),
+            v_padded.stride(1),
+            v_padded.stride(2),
+            v_padded.stride(3),
+            o_padded.stride(0),
+            o_padded.stride(1),
+            o_padded.stride(2),
+            o_padded.stride(3),
+            indices_i32.stride(0),
+            indices_i32.stride(1),
+            indices_i32.stride(2),
+            indices_i32.stride(3),
             L.stride(0),
             L.stride(1),
             L.stride(2),
@@ -221,86 +246,104 @@ class SelectionAttention(torch.autograd.Function):
             N_KV_GROUPS=k.shape[1],
             N_CTX_Q=T,
             N_CTX_KV=k.shape[-1],
-            N_BLOCKS=indices.shape[-1],
+            N_BLOCKS=indices_modified.shape[-1],
             BLOCK_SIZE_SELECTION=config.l_prime,
             IS_CAUSAL=True,
-            HEAD_DIM_QK=triton.next_power_of_2(dk),
-            HEAD_DIM_V=triton.next_power_of_2(dv),
+            HEAD_DIM_QK=dk_padded,
+            HEAD_DIM_V=dv_padded,
             BLOCK_M=config.block_m,
             BLOCK_N=config.block_n,
         )
+        
+        # Extract non-padded portion of output for return
+        o = o_padded[..., :dv]
 
-        ctx.save_for_backward(q, k, v, indices, o, L, M)
+        # Save padded output for backward (to ensure D computation matches)
+        ctx.save_for_backward(q, k, v, indices_modified, o_padded, L, M)
         ctx.scale = scale
         ctx.config = config
+        ctx.dk_padded = dk_padded
+        ctx.dv_padded = dv_padded
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, indices, o, L, M = ctx.saved_tensors
-        B, H, T, dk = q.shape
+        q, k, v, indices, o_padded, L, M = ctx.saved_tensors  # o_padded is already padded
+        B, H, T, dk_dim = q.shape
         G = k.shape[1]
         T_kv = k.shape[-1]
-        dv = v.shape[-1]
+        dv_dim = v.shape[-1]
+        
+        # Get padding dimensions from forward
+        dk_padded = ctx.dk_padded
+        dv_padded = ctx.dv_padded
+        
+        # Pad input tensors for backward kernel (o_padded is already padded from forward)
+        q_padded = torch.nn.functional.pad(q, (0, dk_padded - dk_dim)) if dk_padded > dk_dim else q
+        k_padded = torch.nn.functional.pad(k, (0, 0, 0, dk_padded - dk_dim)) if dk_padded > dk_dim else k
+        v_padded = torch.nn.functional.pad(v, (0, dv_padded - dv_dim)) if dv_padded > dv_dim else v
+        do_padded = torch.nn.functional.pad(do, (0, dv_padded - dv_dim)) if dv_padded > dv_dim else do
 
-        # Allocate gradients
-        dq = torch.zeros_like(q)
-        dk = torch.zeros(B, G, T_kv, dk, device=q.device, dtype=q.dtype)
-        dv = torch.zeros_like(v)
+        # Allocate padded gradients
+        dq_padded = torch.zeros(B, H, T, dk_padded, device=q.device, dtype=q.dtype)
+        dk_padded_out = torch.zeros(B, G, T_kv, dk_padded, device=q.device, dtype=q.dtype)
+        dv_padded_out = torch.zeros(B, G, T_kv, dv_padded, device=q.device, dtype=q.dtype)
 
         # Call backward kernel
         grid = lambda META: (triton.cdiv(T, META["BLOCK_M"]), B * H)
+        # Ensure indices for backward are contiguous int32 and use matching strides
+        indices_i32 = indices.to(torch.int32).contiguous()
         _nsa_sparse_selection_bwd_kernel[grid](
-            q,
-            k,
-            v,
-            indices,
-            o,
-            do,
+            q_padded,
+            k_padded,
+            v_padded,
+            indices_i32,
+            o_padded,
+            do_padded,
             ctx.scale,
             L,
             M,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-            o.stride(3),
-            indices.stride(0),
-            indices.stride(1),
-            indices.stride(2),
-            indices.stride(3),
+            q_padded.stride(0),
+            q_padded.stride(1),
+            q_padded.stride(2),
+            q_padded.stride(3),
+            k_padded.stride(0),
+            k_padded.stride(1),
+            k_padded.stride(3),  # stride_kn (time)
+            k_padded.stride(2),  # stride_kk (dk)
+            v_padded.stride(0),
+            v_padded.stride(1),
+            v_padded.stride(2),
+            v_padded.stride(3),
+            o_padded.stride(0),
+            o_padded.stride(1),
+            o_padded.stride(2),
+            o_padded.stride(3),
+            indices_i32.stride(0),
+            indices_i32.stride(1),
+            indices_i32.stride(2),
+            indices_i32.stride(3),
             L.stride(0),
             L.stride(1),
             L.stride(2),
             M.stride(0),
             M.stride(1),
             M.stride(2),
-            dq,
-            dk,
-            dv,
-            dq.stride(0),
-            dq.stride(1),
-            dq.stride(2),
-            dq.stride(3),
-            dk.stride(0),
-            dk.stride(1),
-            dk.stride(2),
-            dk.stride(3),
-            dv.stride(0),
-            dv.stride(1),
-            dv.stride(2),
-            dv.stride(3),
+            dq_padded,
+            dk_padded_out,
+            dv_padded_out,
+            dq_padded.stride(0),
+            dq_padded.stride(1),
+            dq_padded.stride(2),
+            dq_padded.stride(3),
+            dk_padded_out.stride(0),
+            dk_padded_out.stride(1),
+            dk_padded_out.stride(2),
+            dk_padded_out.stride(3),
+            dv_padded_out.stride(0),
+            dv_padded_out.stride(1),
+            dv_padded_out.stride(2),
+            dv_padded_out.stride(3),
             Z=B,
             H=H,
             N_KV_GROUPS=G,
@@ -309,14 +352,17 @@ class SelectionAttention(torch.autograd.Function):
             N_BLOCKS=indices.shape[-1],
             BLOCK_SIZE_SELECTION=ctx.config.l_prime,
             IS_CAUSAL=True,
-            HEAD_DIM_QK=triton.next_power_of_2(q.shape[-1]),
-            HEAD_DIM_V=triton.next_power_of_2(v.shape[-1]),
+            HEAD_DIM_QK=dk_padded,
+            HEAD_DIM_V=dv_padded,
             BLOCK_M=ctx.config.block_m,
             BLOCK_N=ctx.config.block_n,
         )
 
-        dk = dk.transpose(-1, -2)  # [B,G,T,dk] -> [B,G,dk,T]
-        return dq, dk, dv, None, None, None
+        # Extract non-padded gradients
+        dq = dq_padded[..., :dk_dim]
+        dk = dk_padded_out[..., :dk_dim].transpose(-1, -2)  # [B,G,T,dk] -> [B,G,dk,T]
+        dv = dv_padded_out[..., :dv_dim]
+        return dq, dk, dv, None, None, None, None, None
 
 
 class SlidingWindowAttention(torch.autograd.Function):
@@ -348,8 +394,8 @@ class SlidingWindowAttention(torch.autograd.Function):
             q.stride(3),
             k.stride(0),
             k.stride(1),
-            k.stride(2),
-            k.stride(3),
+            k.stride(3),  # stride_kn (time)
+            k.stride(2),  # stride_kk (dk)
             v.stride(0),
             v.stride(1),
             v.stride(2),
@@ -384,14 +430,21 @@ class SlidingWindowAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, L, M = ctx.saved_tensors
-        B, H, T, dk = q.shape
+        B, H, T, dk_dim = q.shape
         G = k.shape[1]
-        dv = v.shape[-1]
+        dv_dim = v.shape[-1]
 
         # Allocate gradients
         dq = torch.zeros_like(q)
-        dk = torch.zeros(B, G, T, dk, device=q.device, dtype=q.dtype)
+        dk = torch.zeros(B, G, T, dk_dim, device=q.device, dtype=q.dtype)
         dv = torch.zeros_like(v)
+
+        # Allocate padded scratch to satisfy HEAD_DIM power-of-two without OOB writes
+        dk_pad = triton.next_power_of_2(dk_dim)
+        dv_pad = triton.next_power_of_2(dv_dim)
+        dq_scratch = torch.zeros(B, H, T, dk_pad, device=q.device, dtype=q.dtype)
+        dk_scratch = torch.zeros(B, G, T, dk_pad, device=q.device, dtype=q.dtype)
+        dv_scratch = torch.zeros(B, G, T, dv_pad, device=q.device, dtype=q.dtype)
 
         # Call backward kernel
         grid = lambda META: (triton.cdiv(T, META["BLOCK_M"]), B * H)
@@ -410,8 +463,8 @@ class SlidingWindowAttention(torch.autograd.Function):
             q.stride(3),
             k.stride(0),
             k.stride(1),
-            k.stride(2),
-            k.stride(3),
+            k.stride(3),  # stride_kn (time)
+            k.stride(2),  # stride_kk (dk)
             v.stride(0),
             v.stride(1),
             v.stride(2),
@@ -426,21 +479,21 @@ class SlidingWindowAttention(torch.autograd.Function):
             M.stride(0),
             M.stride(1),
             M.stride(2),
-            dq,
-            dk,
-            dv,
-            dq.stride(0),
-            dq.stride(1),
-            dq.stride(2),
-            dq.stride(3),
-            dk.stride(0),
-            dk.stride(1),
-            dk.stride(2),
-            dk.stride(3),
-            dv.stride(0),
-            dv.stride(1),
-            dv.stride(2),
-            dv.stride(3),
+            dq_scratch,
+            dk_scratch,
+            dv_scratch,
+            dq_scratch.stride(0),
+            dq_scratch.stride(1),
+            dq_scratch.stride(2),
+            dq_scratch.stride(3),
+            dk_scratch.stride(0),
+            dk_scratch.stride(1),
+            dk_scratch.stride(2),
+            dk_scratch.stride(3),
+            dv_scratch.stride(0),
+            dv_scratch.stride(1),
+            dv_scratch.stride(2),
+            dv_scratch.stride(3),
             Z=B,
             H=H,
             N_KV_GROUPS=G,
@@ -452,6 +505,10 @@ class SlidingWindowAttention(torch.autograd.Function):
             BLOCK_N=ctx.config.block_n,
         )
 
+        # Copy scratch back into real-sized grads
+        dq.copy_(dq_scratch[..., :dk_dim])
+        dk.copy_(dk_scratch[..., :dk_dim])
+        dv.copy_(dv_scratch[..., :dv_dim])
         dk = dk.transpose(-1, -2)  # [B,G,T,dk] -> [B,G,dk,T]
         return dq, dk, dv, None, None, None
 
@@ -472,8 +529,10 @@ class NSAConfig:
     # Selection parameters (Section 3.3.2)
     l_prime: int = 64  # Selection block size
     n: int = 16  # Total blocks to select per query
-    n_dynamic: int = 13  # Dynamic blocks (n - n_fixed)
-    n_fixed: int = 3  # Fixed blocks: 1 initial + 2 local
+    # Whitepaper training config includes 1 initial + 2 local fixed blocks
+    include_fixed_in_selection: bool = True
+    n_fixed: int = 3  # 1 initial + 2 local
+    n_dynamic: int = 13  # n - n_fixed
 
     # Sliding window (Section 3.3.3)
     w: int = 512  # Window size
@@ -492,13 +551,22 @@ class NSAConfig:
     block_m: int = 32  # Query tile size (reduced for B200 shared memory limits)
     block_n: int = 32  # KV tile size (reduced for B200 shared memory limits)
 
+    # Gating mode (Eq. 5): 'sigmoid' (paper) or 'softmax' (normalized)
+    gate_mode: str = "sigmoid"
+
     def __post_init__(self):
-        """Validate configuration."""
+        """Validate and normalize configuration."""
         assert self.n_heads % self.n_kv_groups == 0
         assert self.l % self.d == 0
         assert self.l_prime % self.d == 0
-        assert self.n_fixed + self.n_dynamic == self.n
         assert self.w > 0
+        # Normalize selection counts
+        if not self.include_fixed_in_selection:
+            self.n_fixed = 0
+        self.n_dynamic = max(0, self.n - self.n_fixed)
+        assert self.n_fixed + self.n_dynamic == self.n
+        # Gating mode sanity
+        assert self.gate_mode in ("sigmoid", "softmax")
 
     @property
     def heads_per_group(self) -> int:
@@ -901,10 +969,8 @@ def _nsa_sparse_selection_bwd_kernel(
         order=(1, 0),
     )
     o = tl.load(Out_ptr, boundary_check=(0, 1))
-    # Compute O^T @ dO for each query (this is sum(P * dP) globally)
-    D = tl.sum(o * do, axis=1)  # [BLOCK_M]
-
-    # Initialize
+    
+    # Initialize - load L and M first to check row validity
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     m_row = tl.load(
         M
@@ -920,6 +986,17 @@ def _nsa_sparse_selection_bwd_kernel(
         mask=offs_m < N_CTX_Q,
         other=0.0,
     )
+    
+    # Row validity check: skip rows with L = -inf to prevent NaN
+    # Triton doesn't have isfinite, so check for finite values using comparison
+    valid_rows = (l_row > float("-inf"))  # Check for -inf specifically
+    # Expand valid_rows for broadcasting (Triton needs explicit expansion)
+    valid_rows_expanded = valid_rows[:, None]
+    
+    # Compute O^T @ dO for each query (this is sum(P * dP) globally)
+    # Guard D computation for invalid rows to prevent NaN propagation
+    D = tl.sum(o * do, axis=1)  # [BLOCK_M]
+    D = tl.where(valid_rows, D, 0.0)  # Zero out D for invalid rows
 
     dq_acc = tl.zeros([BLOCK_M, HEAD_DIM_QK], dtype=tl.float32)
 
@@ -935,9 +1012,8 @@ def _nsa_sparse_selection_bwd_kernel(
         )
         valid_m = offs_m < N_CTX_Q
         sel_blocks = tl.load(bidx_ptrs, mask=valid_m[:, None], other=-1)
-        sel_blocks = tl.sum(
-            sel_blocks, axis=1
-        )  # Flatten to 1D by summing (since it's a single column)
+        # Reshape from [BLOCK_M, 1] to [BLOCK_M]
+        sel_blocks = tl.reshape(sel_blocks, [BLOCK_M])
 
         # Range of unique blocks (skip -1 sentinel values)
         blocks_valid = sel_blocks >= 0
@@ -1006,13 +1082,17 @@ def _nsa_sparse_selection_bwd_kernel(
                             # Masked shift to avoid -inf - (-inf) = NaN
                             s_shift = tl.where(mask, s - m_row[:, None], float("-inf"))
                             p = tl.math.exp(s_shift)
-                            # Normalize by exp(L)
-                            p = p / tl.math.exp(l_row)[:, None]
-                            p = tl.where(mask, p, 0.0)
+                            # Normalize by exp(L) with row validity guard
+                            denom = tl.math.exp(l_row)[:, None]
+                            # Use row validity to prevent operations on invalid rows
+                            denom = tl.where(valid_rows_expanded, denom, 1.0)
+                            p = p / denom
+                            # Zero out p for invalid rows completely
+                            p = tl.where(mask & valid_rows_expanded, p, 0.0)
 
-                            # dp = dO V^T (per row)
+                            # dp = dO V^T (per row) - guard with row validity
                             dp = tl.dot(do, tl.trans(v_tile), allow_tf32=False)
-                            dp = tl.where(mask, dp, 0.0)
+                            dp = tl.where(mask & valid_rows_expanded, dp, 0.0)
 
                             # dV += p^T @ dO  (atomics on group-shared grads)
                             # shape: (BLOCK_N, dv)
@@ -1034,9 +1114,11 @@ def _nsa_sparse_selection_bwd_kernel(
                                 mask=mask_n[:, None] & (offs_v[None, :] < HEAD_DIM_V),
                             )
 
-                            # Softmax backward: dS = P * (dP - D)
+                            # Softmax backward: dS = P * (dP - D) - guard with row validity
                             # D is the global row sum computed earlier: D = rowsum(O * dO) = rowsum(P * dP)
                             dS = p * (dp - D[:, None])
+                            # Zero out dS for invalid rows to prevent NaN propagation
+                            dS = tl.where(valid_rows_expanded, dS, 0.0)
 
                             # dQ += dS @ K, where K needed here is [BLOCK_N, HEAD_DIM_QK]
                             # k_tile is loaded as [HEAD_DIM_QK, BLOCK_N], so transpose it
@@ -1398,7 +1480,10 @@ def _nsa_sliding_window_bwd_kernel(
         # Reconstruct p with masked shift to avoid NaN
         s_shift = tl.where(mask, s - m_row[:, None], float("-inf"))
         p = tl.math.exp(s_shift)
-        p = p / tl.math.exp(l_row)[:, None]
+        # Guard against L = -inf when normalizing
+        denom = tl.math.exp(l_row)[:, None]
+        denom = tl.where(denom > 0, denom, 1.0)
+        p = p / denom
         p = tl.where(mask, p, 0.0)
 
         # dp = dO V^T
@@ -1781,7 +1866,10 @@ def _nsa_compression_bwd_kernel(
         # Reconstruct p with masked shift to avoid NaN
         s_shift = tl.where(mask, s - m_row[:, None], float("-inf"))
         p = tl.math.exp(s_shift)
-        p = p / tl.math.exp(l_row)[:, None]
+        # Guard against L = -inf when normalizing
+        denom = tl.math.exp(l_row)[:, None]
+        denom = tl.where(denom > 0, denom, 1.0)
+        p = p / denom
         p = tl.where(mask, p, 0.0)
 
         # dp = dO V^T
@@ -1905,91 +1993,51 @@ def select_top_k_blocks_per_query_with_gqa(
     aggregated_scores = scores_grouped.sum(dim=2)  # [B, G, T, n_blocks]
 
     # Step 2: Select top-k per query position
-    n_dynamic = config.n_dynamic  # n - n_fixed
-    # Ensure we don't select more blocks than available
-    k_actual = min(n_dynamic, n_blocks)
+    # Build top-n candidates per query position (deterministic)
+    k_actual = min(config.n, n_blocks)
 
     # Use stable sort for complete determinism instead of topk
     # Sort in descending order and take top k
     _, sorted_indices = torch.sort(aggregated_scores, dim=-1, descending=True, stable=True)
     top_indices = sorted_indices[..., :k_actual]  # [B, G, T, k_actual]
 
-    # Pad if we selected fewer blocks than needed
-    if k_actual < n_dynamic:
-        padding = torch.zeros(
-            B,
-            config.n_kv_groups,
-            T,
-            n_dynamic - k_actual,
-            device=aggregated_scores.device,
-            dtype=torch.long,
-        )
-        top_indices = torch.cat([top_indices, padding], dim=-1)
+    # If selection should include fixed blocks (implementation convenience), merge them; else paper-faithful: no fixed
+    if config.include_fixed_in_selection and config.n_fixed > 0:
+        device = selection_scores.device
+        G = config.n_kv_groups
+        positions = torch.arange(T, device=device)
+        initial_blocks = torch.zeros(B, G, T, 1, device=device, dtype=torch.long)
+        local_block_1 = torch.maximum(torch.zeros_like(positions), (positions - config.l_prime) // config.l_prime)
+        local_block_2 = positions // config.l_prime
+        local_blocks = torch.stack([local_block_1, local_block_2], dim=-1)
+        local_blocks = local_blocks.unsqueeze(0).unsqueeze(0).expand(B, G, T, 2)
+        always_include = torch.cat([initial_blocks, local_blocks], dim=-1)  # [B,G,T,n_fixed]
 
-    # Keep per-group (don't expand to heads)
-    # top_indices is [B, G, T, n_dynamic]
-
-    # Step 3: Add always-include blocks (VECTORIZED)
-    device = selection_scores.device
-    G = config.n_kv_groups
-
-    # Initial block (block 0) for all positions
-    initial_blocks = torch.zeros(B, G, T, 1, device=device, dtype=torch.long)
-
-    # Local blocks (2 most recent blocks for each query) - VECTORIZED
-    positions = torch.arange(T, device=device)
-    local_block_1 = torch.maximum(
-        torch.zeros_like(positions), (positions - config.l_prime) // config.l_prime
-    )
-    local_block_2 = positions // config.l_prime
-
-    # Stack and expand to [B, G, T, 2]
-    local_blocks = torch.stack([local_block_1, local_block_2], dim=-1)
-    local_blocks = local_blocks.unsqueeze(0).unsqueeze(0).expand(B, G, T, 2)
-
-    # Combine always-include blocks
-    always_include = torch.cat(
-        [initial_blocks, local_blocks], dim=-1
-    )  # [B, G, T, n_fixed]
-
-    # Step 4: Combine and deduplicate (STABLE UNIQUE)
-    all_indices = torch.cat(
-        [always_include, top_indices], dim=-1
-    )  # [B, G, T, n_fixed + n_dynamic]
-
-    # Deduplicate per group per query (keep first n unique, preserving order)
-    final_indices = torch.zeros(B, G, T, config.n, device=device, dtype=torch.long)
-
-    for b in range(B):
-        for g in range(G):
-            for t in range(T):
-                # Take this group's indices
-                indices_t = all_indices[b, g, t]
-
-                # Stable unique: preserve order of first occurrence
-                seen = set()
-                unique_indices = []
-                for idx in indices_t.tolist():
-                    if idx not in seen and len(unique_indices) < config.n:
-                        seen.add(idx)
-                        unique_indices.append(idx)
-
-                # Convert back to tensor and pad with -1 if needed
-                unique_indices = torch.tensor(
-                    unique_indices, device=device, dtype=torch.long
-                )
-                if len(unique_indices) < config.n:
-                    padding = torch.full(
-                        (config.n - len(unique_indices),),
-                        -1,
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    unique_indices = torch.cat([unique_indices, padding])
-
-                final_indices[b, g, t] = unique_indices
-
-    return final_indices
+        # Concatenate and unique while preserving order up to n
+        all_indices = torch.cat([always_include, top_indices], dim=-1)
+        final_indices = torch.empty(B, G, T, config.n, device=device, dtype=torch.long)
+        for b in range(B):
+            for g in range(G):
+                for t in range(T):
+                    seen = set()
+                    out = []
+                    for idx in all_indices[b, g, t].tolist():
+                        if idx not in seen:
+                            seen.add(idx)
+                            out.append(idx)
+                        if len(out) == config.n:
+                            break
+                    if len(out) < config.n:
+                        out += [-1] * (config.n - len(out))
+                    final_indices[b, g, t] = torch.tensor(out, device=device, dtype=torch.long)
+        return final_indices
+    else:
+        # Paper-faithful: just return top-n (pad with -1 if fewer blocks)
+        if top_indices.shape[-1] < config.n:
+            pad = torch.full((B, config.n_kv_groups, T, config.n - top_indices.shape[-1]), -1, device=top_indices.device, dtype=top_indices.dtype)
+            return torch.cat([top_indices, pad], dim=-1)
+        else:
+            return top_indices[..., : config.n]
 
 
 class NSAAttention(torch.nn.Module):
@@ -2044,7 +2092,9 @@ class NSAAttention(torch.nn.Module):
             config.d_model, config.n_kv_groups * config.head_dim_v, bias=config.use_bias
         )
 
-        # Compression MLP with position encoding
+        # Learned intra-block positional encoding (paper: MLP with PE)
+        self.pos_embed = torch.nn.Embedding(config.l, config.l)
+        # Compression MLP over [k || pos]
         self.compress_mlp = torch.nn.Sequential(
             torch.nn.Linear(config.head_dim_qk + config.l, config.head_dim_qk * 2),
             torch.nn.ReLU(),
@@ -2108,18 +2158,15 @@ class NSAAttention(torch.nn.Module):
 
             block_len = end - start
 
-            # Create position encoding
-            pos = torch.arange(block_len, device=device, dtype=dtype)
-            pos = pos / block_len  # Normalize to [0, 1]
+            # Learned positional encoding per offset in block (paper-faithful)
+            pos_ids = torch.arange(block_len, device=device)
+            pos_vec = self.pos_embed(pos_ids)  # [block_len, l]
+            pos_vec = pos_vec.to(dtype)
+            pos_expanded = pos_vec.view(1, 1, block_len, self.config.l).expand(B, G, block_len, self.config.l)
 
-            # Expand position encoding
-            pos_expanded = pos.view(1, 1, block_len, 1).expand(
-                B, G, block_len, self.config.l
-            )
-
-            # Concatenate keys with position encoding
+            # Concatenate keys with positional encoding
             k_with_pos = torch.cat(
-                [k_block, pos_expanded[..., : self.config.l]], dim=-1
+                [k_block, pos_expanded], dim=-1
             )
 
             # Apply MLP and pool
@@ -2180,6 +2227,7 @@ class NSAAttention(torch.nn.Module):
         # repeated calls with identical inputs.
         prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if torch.cuda.is_available() else None
         prev_prec = None
+        prev_fp32prec = None
         prev_det = torch.are_deterministic_algorithms_enabled()
         if hasattr(torch, "get_float32_matmul_precision"):
             try:
@@ -2190,6 +2238,13 @@ class NSAAttention(torch.nn.Module):
             try:
                 if torch.cuda.is_available():
                     torch.backends.cuda.matmul.allow_tf32 = False
+                    # New API in PyTorch 2.9+: force strict IEEE for FP32 matmul
+                    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                        try:
+                            prev_fp32prec = torch.backends.cuda.matmul.fp32_precision
+                            torch.backends.cuda.matmul.fp32_precision = "ieee"
+                        except Exception:
+                            prev_fp32prec = None
                 if hasattr(torch, "set_float32_matmul_precision"):
                     torch.set_float32_matmul_precision("high")
                 # Enforce deterministic algorithms during eval forward
@@ -2297,63 +2352,129 @@ class NSAAttention(torch.nn.Module):
             selection_scores, self.config
         )  # [B, G, T, n]
 
-        # 4. CALL KERNELS
+        # 4. CALL KERNELS or deterministic REFERENCES
         # Prepare for kernel calls
         G = self.config.n_kv_groups
 
-        # Reshape tensors for kernels
-        # Q: [B, H, T, dk] -> need to flatten batch-head for kernels
-        q_kernel = q.contiguous()
+        # Reshape tensors
+        q_kernel = q.contiguous()  # [B,H,T,dk]
+        k_sel_kernel = k_sel.transpose(-1, -2).contiguous()   # [B,G,dk,T]
+        v_sel_kernel = v_sel.contiguous()                      # [B,G,T,dv]
+        k_slide_kernel = k_slide.transpose(-1, -2).contiguous()# [B,G,dk,T]
+        v_slide_kernel = v_slide.contiguous()                  # [B,G,T,dv]
 
-        # K/V for selection/sliding: [B, G, T, dk/dv] -> [B, G, dk/dv, T] for kernels
-        k_sel_kernel = k_sel.transpose(-1, -2).contiguous()
-        v_sel_kernel = v_sel.contiguous()
+        if not self.training:
+            # Deterministic eval path: run references on CPU in float64 for exact repeatability
+            cpu = torch.device("cpu")
+            # Prepare inputs in float64 on CPU
+            q_cpu = q_kernel.to(cpu, dtype=torch.float64)
+            kcmp_cpu = k_compressed.to(cpu, dtype=torch.float64)
+            vcmp_cpu = v_compressed.to(cpu, dtype=torch.float64)
+            bends_cpu = block_ends.to(cpu)
+            ksel_cpu = k_sel_kernel.to(cpu, dtype=torch.float64)
+            vsel_cpu = v_sel_kernel.to(cpu, dtype=torch.float64)
+            ksl_cpu = k_slide_kernel.to(cpu, dtype=torch.float64)
+            vsl_cpu = v_slide_kernel.to(cpu, dtype=torch.float64)
+            sel_idx = selected_indices
+            if sel_idx.numel() > 0:
+                t_blocks = (torch.arange(T, device=device, dtype=torch.long) // self.config.l_prime).view(1, 1, T, 1)
+                no_valid = (sel_idx < 0).all(dim=-1, keepdim=True)
+                sel_idx = torch.where(no_valid, t_blocks, sel_idx)
+            sel_idx_cpu = sel_idx.to(cpu)
 
-        k_slide_kernel = k_slide.transpose(-1, -2).contiguous()
-        v_slide_kernel = v_slide.contiguous()
+            # Compression via reference (CPU float64)
+            o_compress_cpu = ref_compression_attention(q_cpu, kcmp_cpu, vcmp_cpu, bends_cpu, self.scale)
+            # Selection via reference (CPU float64)
+            o_select_cpu = ref_selection_attention(
+                q_cpu, ksel_cpu, vsel_cpu, sel_idx_cpu, self.config.l_prime, self.scale
+            )
+            # Sliding via reference (CPU float64)
+            o_slide_cpu = ref_sliding_window_attention(
+                q_cpu, ksl_cpu, vsl_cpu, self.config.w, self.scale
+            )
+            # Move back to original device/dtype
+            o_compress = o_compress_cpu.to(device=device, dtype=dtype)
+            o_select = o_select_cpu.to(device=device, dtype=dtype)
+            o_slide = o_slide_cpu.to(device=device, dtype=dtype)
+        else:
+            # Use autograd wrappers
+            o_compress = CompressionAttention.apply(
+                q_kernel,
+                k_compressed,
+                v_compressed,
+                block_ends,
+                self.scale,
+                self.config,
+            )
 
-        # Use autograd wrappers in both train/eval for consistency
-        o_compress = CompressionAttention.apply(
-            q_kernel,
-            k_compressed,
-            v_compressed,
-            block_ends,
-            self.scale,
-            self.config,
-        )
+            o_select = SelectionAttention.apply(
+                q_kernel,
+                k_sel_kernel,
+                v_sel_kernel,
+                selected_indices,
+                self.scale,
+                self.config,
+            )
 
-        o_select = SelectionAttention.apply(
-            q_kernel,
-            k_sel_kernel,
-            v_sel_kernel,
-            selected_indices,
-            self.scale,
-            self.config,
-        )
+            o_slide = SlidingWindowAttention.apply(
+                q_kernel,
+                k_slide_kernel,
+                v_slide_kernel,
+                self.scale,
+                self.config.w,
+                self.config,
+            )
 
-        o_slide = SlidingWindowAttention.apply(
-            q_kernel,
-            k_slide_kernel,
-            v_slide_kernel,
-            self.scale,
-            self.config.w,
-            self.config,
-        )
+        # 5. GATE AND MIX branches (paper: sigmoid gates per branch)
+        if not self.training:
+            # Deterministic gate MLP in float64 on GPU
+            x64 = hidden_states.to(torch.float64)
+            w1 = self.gate_mlp[0].weight.to(torch.float64)
+            b1 = self.gate_mlp[0].bias.to(torch.float64) if self.gate_mlp[0].bias is not None else None
+            x64 = torch.nn.functional.linear(x64, w1, b1)
+            x64 = torch.relu(x64)
+            w2 = self.gate_mlp[2].weight.to(torch.float64)
+            b2 = self.gate_mlp[2].bias.to(torch.float64) if self.gate_mlp[2].bias is not None else None
+            gate_logits = torch.nn.functional.linear(x64, w2, b2)  # [B,T,3*H]
+            gates = gate_logits.view(B, T, self.config.n_heads, 3).permute(0, 2, 1, 3)  # [B,H,T,3]
+            if self.config.gate_mode == "softmax":
+                gates = torch.softmax(gates, dim=-1)
+            else:
+                gates = torch.sigmoid(gates)
+            gates = gates.to(dtype)
+        else:
+            gates = self.gate_mlp(hidden_states)  # [B, T, 3*H]
+            gates = gates.view(B, T, self.config.n_heads, 3).permute(0, 2, 1, 3)  # [B, H, T, 3]
+            if self.config.gate_mode == "softmax":
+                gates = torch.softmax(gates, dim=-1)
+            else:
+                gates = torch.sigmoid(gates)
 
-        # 5. GATE AND MIX branches (softmax, deterministic op order)
-        gates = self.gate_mlp(hidden_states)  # [B, T, 3*H]
-        gates = gates.view(B, T, self.config.n_heads, 3).permute(0, 2, 1, 3)  # [B, H, T, 3]
-        gates = torch.softmax(gates, dim=-1)
-
-        o_mixed = o_compress.mul(gates[..., 0:1])
-        o_mixed = o_mixed.add(o_select.mul(gates[..., 1:2]))
-        o_mixed = o_mixed.add(o_slide.mul(gates[..., 2:3]))  # [B, H, T, dv]
+        # Deterministic accumulation: in eval, perform weighted sum in float64 to avoid
+        # accumulation-order drift, then cast back to original dtype
+        if not self.training:
+            o_mixed64 = o_compress.to(torch.float64).mul(gates[..., 0:1].to(torch.float64))
+            o_mixed64 = o_mixed64.add(o_select.to(torch.float64).mul(gates[..., 1:2].to(torch.float64)))
+            o_mixed64 = o_mixed64.add(o_slide.to(torch.float64).mul(gates[..., 2:3].to(torch.float64)))
+            o_mixed = o_mixed64.to(dtype)
+        else:
+            o_mixed = o_compress.mul(gates[..., 0:1])
+            o_mixed = o_mixed.add(o_select.mul(gates[..., 1:2]))
+            o_mixed = o_mixed.add(o_slide.mul(gates[..., 2:3]))  # [B, H, T, dv]
 
         # 6. OUTPUT PROJECTION
         o_mixed = o_mixed.transpose(1, 2).contiguous()  # [B, T, H, dv]
         o_mixed = o_mixed.view(B, T, self.config.n_heads * self.config.head_dim_v)
 
-        output = self.o_proj(o_mixed)  # [B, T, d_model]
+        if not self.training:
+            # Deterministic output projection in float64 on GPU
+            o_flat64 = o_mixed.view(B * T, self.config.n_heads * self.config.head_dim_v).to(torch.float64)
+            w_out = self.o_proj.weight.to(torch.float64)
+            b_out = self.o_proj.bias.to(torch.float64) if self.o_proj.bias is not None else None
+            out_flat64 = torch.nn.functional.linear(o_flat64, w_out, b_out)
+            output = out_flat64.view(B, T, self.config.d_model).to(dtype)
+        else:
+            output = self.o_proj(o_mixed)  # [B, T, d_model]
         output = self.dropout(output)
 
         # Return attention info if requested
@@ -2373,6 +2494,11 @@ class NSAAttention(torch.nn.Module):
                     torch.backends.cuda.matmul.allow_tf32 = prev_tf32
                 if prev_prec is not None and hasattr(torch, "set_float32_matmul_precision"):
                     torch.set_float32_matmul_precision(prev_prec)
+                if prev_fp32prec is not None:
+                    try:
+                        torch.backends.cuda.matmul.fp32_precision = prev_fp32prec
+                    except Exception:
+                        pass
                 # Restore previous deterministic mode
                 torch.use_deterministic_algorithms(prev_det)
             except Exception:

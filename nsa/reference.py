@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
+from dataclasses import dataclass
 
 
 def sliding_window_attention(
@@ -199,6 +200,58 @@ def dense_attention_reference(
     out = torch.matmul(probs, v_expanded)  # [B, H, T, dv]
 
     return out, probs
+
+
+def selection_attention_reference(
+    q: torch.Tensor,  # [B, H, T, dk]
+    k: torch.Tensor,  # [B, G, dk, T]
+    v: torch.Tensor,  # [B, G, T, dv]
+    selected_indices: torch.Tensor,  # [B, G, T, n]
+    l_prime: int,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Reference implementation for sparse selection attention (paper Eq. 11).
+    - Expands K/V to heads (GQA) and constructs a per-(b,h,t) KV mask from the
+      selected block indices of its group, unioned across blocks, with causal masking.
+    """
+    B, H, T, dk = q.shape
+    G = k.shape[1]
+    T_kv = k.shape[-1]
+    dv = v.shape[-1]
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(dk)
+
+    # Expand K/V to heads
+    heads_per_group = H // G
+    k_expanded = k.unsqueeze(2).expand(B, G, heads_per_group, dk, T_kv).reshape(B, H, dk, T_kv)
+    v_expanded = v.unsqueeze(2).expand(B, G, heads_per_group, T_kv, dv).reshape(B, H, T_kv, dv)
+
+    # Build selection mask [B, H, T, T_kv]
+    mask = torch.zeros(B, H, T, T_kv, device=q.device, dtype=torch.bool)
+    for b in range(B):
+        for h in range(H):
+            g = h // (H // G)
+            for t in range(T):
+                blocks = selected_indices[b, g, t]
+                for idx in blocks.tolist():
+                    if idx < 0:
+                        continue
+                    start = idx * l_prime
+                    end = min(start + l_prime, T_kv)
+                    if start < end:
+                        mask[b, h, t, start:end] = True
+                # causal
+                mask[b, h, t, t + 1 :] = False
+
+    # Compute scores and apply mask
+    # q @ K -> [B, H, T, T_kv]
+    scores = torch.matmul(q * scale, k_expanded)  # K is [B,H,dk,T_kv]
+    scores = scores.masked_fill(~mask, float("-inf"))
+    probs = F.softmax(scores, dim=-1)
+    out = torch.matmul(probs, v_expanded)  # [B,H,T,dv]
+    return out
 
 
 def create_block_ends(

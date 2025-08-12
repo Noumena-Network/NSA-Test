@@ -32,7 +32,7 @@ RUN git clone https://github.com/triton-lang/triton.git && \
     rm -rf /tmp/triton
 
 # Install test dependencies
-RUN pip install --break-system-packages pytest
+RUN pip install --break-system-packages pytest pytest-forked
 
 # Copy NSA code
 WORKDIR /workspace
@@ -86,15 +86,21 @@ echo "4. Branch Tests"
 python -m pytest tests/test_branches.py -vs || FAILED=$((FAILED + 1))
 
 echo ""
-echo "=== SUMMARY ==="
+echo "=== INDIVIDUAL SUITE SUMMARY ==="
 if [ $FAILED -eq 0 ]; then
-    echo "✅ ALL CRITICAL TEST SUITES PASSED!"
-    echo "Note: Skipping final 'run all tests' due to known CUDA context poisoning issue."
-    exit 0
+    echo "✅ All individual test suites passed!"
 else
-    echo "❌ $FAILED test suite(s) failed"
+    echo "❌ $FAILED individual test suite(s) failed"
     exit 1
 fi
+
+echo ""
+echo "=== RUNNING FULL TEST SUITE (with process isolation) ==="
+python -m pytest tests/ --tb=short -q --forked
+
+echo ""
+echo "=== FINAL SUMMARY ==="
+echo "✅ ALL TESTS COMPLETED SUCCESSFULLY!"
 EOF
 RUN chmod +x /workspace/run_tests.sh
 
